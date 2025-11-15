@@ -132,7 +132,7 @@ seen_files = set(os.listdir(WATCH_DIR))
 def check_for_new_files():
     global seen_files
     start_time = time.time()
-    while time.time() - start_time < 30:
+    while time.time() - start_time < 60:
         current_files = set(os.listdir(WATCH_DIR))
         new_files = current_files - seen_files
         for file in new_files:
@@ -151,5 +151,5 @@ def check_for_new_files():
 # -------------------------------
 keyboard.add_hotkey(keybind, check_for_new_files)
 
-print(f"Press {keybind} to check for new files in '{WATCH_DIR}' for 30 seconds. Press ESC to quit.")
-keyboard.wait("esc")
+print(f"Press {keybind} to check for new files in '{WATCH_DIR}' for 60 seconds.")
+
