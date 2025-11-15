@@ -5,7 +5,7 @@ sound=no
 popup=yes
 check_time=30
 
-savereplaysdirectory="D:\Users\fznv6\Videos D drive\OBS"
+savereplaysdirectory="D:\Users\<YOUR USERNAME>\Videos\OBS"
 
 obs_exe_path="C:\Program Files\obs-studio\bin\64bit\obs64.exe"
-obs_args="--disable-crash-handler --disable-shutdown-check --startreplaybuffer --minimize-to-tray"s
+obs_args="--disable-crash-handler --disable-shutdown-check --startreplaybuffer --minimize-to-tray"
