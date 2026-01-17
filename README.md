@@ -8,3 +8,4 @@ There is a setup script to automatically fetch your settings, but you can use th
 
 You can set your preferences in the settings.txt file.
 
+P.S. Add: --scene "name-of-your-scene" to obs args in settings.txt if you want it to start with a specific scene.
