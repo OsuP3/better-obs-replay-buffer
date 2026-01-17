@@ -7,7 +7,24 @@ import msvcrt
 import atexit
 import queue
 import logging
+import ctypes
 from logging.handlers import RotatingFileHandler
+
+# -------------------------------
+# Set process name for Task Manager
+# -------------------------------
+PROCESS_NAME = "BetterReplayBuffer"
+try:
+    # This sets the App User Model ID which helps identify the process
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(PROCESS_NAME)
+except:
+    pass
+
+# Set console title
+try:
+    ctypes.windll.kernel32.SetConsoleTitleW(PROCESS_NAME)
+except:
+    pass
 
 # -------------------------------
 # Logging (runs in background -> log file)
@@ -33,7 +50,7 @@ def _atomic_write(path: str, data: str):
         f.write(data)
     os.replace(tmp, path)
 
-# Try to lock; if already locked, request refresh and exit
+# Try to lock. if already locked, request refresh and exit
 try:
     lock_file = open(lock_file_path, "w")
     msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
