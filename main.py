@@ -4,6 +4,8 @@ import os
 import sys
 import subprocess
 import time
+import re
+import configparser
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(SCRIPT_DIR, "settings.txt")
@@ -11,6 +13,249 @@ REPLAY_SCRIPT = os.path.join(SCRIPT_DIR, "better-replay-buffer.pyw")
 TEMP = os.getenv("TEMP") or os.getenv("TMP") or "."
 REFRESH_FILE = os.path.join(TEMP, "obs_toast.refresh")
 PID_FILE = os.path.join(TEMP, "obs_toast.pid")
+FIRST_RUN_FILE = os.path.join(SCRIPT_DIR, ".setup_done")
+
+# -------------------------------
+# Auto-detection functions (from setup.bat logic)
+# -------------------------------
+def auto_detect_settings():
+    """Auto-detect OBS settings like the setup.bat does"""
+    detected = {}
+    
+    appdata = os.getenv("APPDATA")
+    if not appdata:
+        return detected
+    
+    obs_root = os.path.join(appdata, "obs-studio")
+    if not os.path.exists(obs_root):
+        return detected
+    
+    # Read global.ini to get active profile
+    global_ini = os.path.join(obs_root, "global.ini")
+    profile_name = None
+    
+    if os.path.exists(global_ini):
+        try:
+            with open(global_ini, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("Profile="):
+                        profile_name = line.split("=", 1)[1].strip()
+                        break
+        except:
+            pass
+    
+    # Fallback: pick first profile folder
+    if not profile_name:
+        profiles_dir = os.path.join(obs_root, "basic", "profiles")
+        if os.path.exists(profiles_dir):
+            for d in os.listdir(profiles_dir):
+                if os.path.isdir(os.path.join(profiles_dir, d)):
+                    profile_name = d
+                    break
+    
+    if not profile_name:
+        return detected
+    
+    profile_ini = os.path.join(obs_root, "basic", "profiles", profile_name, "basic.ini")
+    
+    if os.path.exists(profile_ini):
+        try:
+            # Read recording path
+            with open(profile_ini, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Try RecFilePath first (Advanced Output)
+            match = re.search(r'^RecFilePath=(.+)$', content, re.MULTILINE)
+            if not match:
+                # Try FilePath (Simple Output)
+                match = re.search(r'^FilePath=(.+)$', content, re.MULTILINE)
+            
+            if match:
+                rec_path = match.group(1).strip().strip('"').replace("\\\\", "\\")
+                if rec_path.endswith("\\"):
+                    rec_path = rec_path[:-1]
+                detected["savereplaysdirectory"] = rec_path
+            
+            # Try to extract hotkey
+            hotkey_match = re.search(r'^ReplayBuffer=(.+)$', content, re.MULTILINE)
+            if hotkey_match:
+                hotkey_data = hotkey_match.group(1)
+                parsed = parse_obs_hotkey(hotkey_data)
+                if parsed:
+                    detected["savereplaykeybind"] = parsed
+        except:
+            pass
+    
+    # Detect OBS executable
+    obs_paths = [
+        r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
+        r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe",
+    ]
+    for path in obs_paths:
+        if os.path.exists(path):
+            detected["obs_exe_path"] = path
+            break
+    
+    return detected
+
+def parse_obs_hotkey(hotkey_data):
+    """Parse OBS hotkey JSON-like format to simple format"""
+    parts = []
+    
+    # Check modifiers
+    if re.search(r'shift.*true', hotkey_data, re.IGNORECASE):
+        parts.append("shift")
+    if re.search(r'control.*true', hotkey_data, re.IGNORECASE):
+        parts.append("ctrl")
+    if re.search(r'alt.*true', hotkey_data, re.IGNORECASE):
+        parts.append("alt")
+    
+    # Extract key from OBS_KEY_X format
+    key_match = re.search(r'OBS_KEY_(\w+)', hotkey_data)
+    if key_match:
+        key = key_match.group(1).lower()
+        parts.append(key)
+        return "+".join(parts)
+    
+    return None
+
+def get_obs_scenes():
+    """Get list of scenes from OBS scene collection"""
+    scenes = []
+    
+    appdata = os.getenv("APPDATA")
+    if not appdata:
+        return scenes
+    
+    obs_root = os.path.join(appdata, "obs-studio")
+    scenes_dir = os.path.join(obs_root, "basic", "scenes")
+    
+    if not os.path.exists(scenes_dir):
+        return scenes
+    
+    # Find the active scene collection from global.ini
+    global_ini = os.path.join(obs_root, "global.ini")
+    scene_collection = None
+    
+    if os.path.exists(global_ini):
+        try:
+            with open(global_ini, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("SceneCollection="):
+                        scene_collection = line.split("=", 1)[1].strip()
+                        break
+        except:
+            pass
+    
+    # Find the scene collection JSON file
+    scene_file = None
+    if scene_collection:
+        scene_file = os.path.join(scenes_dir, f"{scene_collection}.json")
+    
+    if not scene_file or not os.path.exists(scene_file):
+        # Fallback: use first .json file
+        for f in os.listdir(scenes_dir):
+            if f.endswith(".json"):
+                scene_file = os.path.join(scenes_dir, f)
+                break
+    
+    if scene_file and os.path.exists(scene_file):
+        try:
+            import json
+            with open(scene_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # Extract scene names
+            if "sources" in data:
+                for source in data["sources"]:
+                    if source.get("id") == "scene" or source.get("versioned_id", "").startswith("scene"):
+                        name = source.get("name")
+                        if name:
+                            scenes.append(name)
+        except:
+            pass
+    
+    return scenes
+
+def get_scene_from_args(args):
+    """Extract --scene value from obs args"""
+    match = re.search(r'--scene\s+"([^"]+)"', args)
+    if match:
+        return match.group(1)
+    match = re.search(r'--scene\s+(\S+)', args)
+    if match:
+        return match.group(1)
+    return None
+
+def set_scene_in_args(args, scene):
+    """Set or remove --scene in obs args"""
+    # Remove existing --scene argument
+    args = re.sub(r'\s*--scene\s+"[^"]+"', '', args)
+    args = re.sub(r'\s*--scene\s+\S+', '', args)
+    args = args.strip()
+    
+    if scene and scene != "(None)":
+        args = f'{args} --scene "{scene}"'
+    
+    return args
+
+def run_auto_setup():
+    """Run auto-detection and update settings"""
+    detected = auto_detect_settings()
+    
+    if not detected:
+        messagebox.showwarning("Auto-Setup", "Could not auto-detect OBS settings.\nPlease configure manually.")
+        return False
+    
+    # Update the entry fields with detected values
+    changes = []
+    
+    if "savereplaysdirectory" in detected:
+        savereplaysdirectory_entry.delete(0, tk.END)
+        savereplaysdirectory_entry.insert(0, detected["savereplaysdirectory"])
+        changes.append(f"Replay Directory: {detected['savereplaysdirectory']}")
+    
+    if "savereplaykeybind" in detected:
+        savereplaykeybind_entry.delete(0, tk.END)
+        savereplaykeybind_entry.insert(0, detected["savereplaykeybind"])
+        changes.append(f"Hotkey: {detected['savereplaykeybind']}")
+    
+    if "obs_exe_path" in detected:
+        obs_exe_path_entry.delete(0, tk.END)
+        obs_exe_path_entry.insert(0, detected["obs_exe_path"])
+        changes.append(f"OBS Path: {detected['obs_exe_path']}")
+    
+    if changes:
+        save_status_label.config(text="✓ Auto-detected: " + ", ".join(changes[:2]), fg="green")
+        root.after(4000, lambda: save_status_label.config(text=""))
+        return True
+    else:
+        messagebox.showwarning("Auto-Setup", "No settings could be auto-detected.")
+        return False
+
+def check_first_run():
+    """Check if this is the first run and offer auto-setup"""
+    if not os.path.exists(SETTINGS_FILE) or not os.path.exists(FIRST_RUN_FILE):
+        result = messagebox.askyesno(
+            "First Time Setup",
+            "Would you like to auto-detect settings from OBS?\n\n"
+            "This will try to find:\n"
+            "• Your replay buffer save directory\n"
+            "• Your replay buffer hotkey\n"
+            "• OBS installation path\n\n"
+            "You can also run this later from the 'Auto-Setup' button."
+        )
+        
+        # Mark setup as done
+        try:
+            with open(FIRST_RUN_FILE, "w") as f:
+                f.write("1")
+        except:
+            pass
+        
+        if result:
+            # Delay to let the main window render first
+            root.after(100, run_auto_setup)
 
 # Startup shortcut path
 STARTUP_FOLDER = os.path.join(os.getenv("APPDATA"), r"Microsoft\Windows\Start Menu\Programs\Startup")
@@ -247,6 +492,11 @@ def save_and_refresh():
     # Get current saved settings for comparison
     old_settings = read_settings()
     
+    # Handle scene selection - update obs_args with scene
+    obs_args = obs_args_entry.get()
+    selected_scene = scene_combo.get()
+    obs_args = set_scene_in_args(obs_args, selected_scene)
+    
     new_settings = {
         "savereplaysound": savereplaysound_entry.get(),
         "savereplaykeybind": savereplaykeybind_entry.get(),
@@ -255,9 +505,13 @@ def save_and_refresh():
         "check_time": check_time_entry.get(),
         "savereplaysdirectory": savereplaysdirectory_entry.get(),
         "obs_exe_path": obs_exe_path_entry.get(),
-        "obs_args": obs_args_entry.get(),
+        "obs_args": obs_args,
         "include_obs": "yes" if include_obs_var.get() else "no",
     }
+    
+    # Also update the entry field to show the scene argument
+    obs_args_entry.delete(0, tk.END)
+    obs_args_entry.insert(0, obs_args)
     
     # Check if any script-related settings changed
     script_settings_changed = any(
@@ -440,6 +694,34 @@ obs_args_entry.insert(0, current_settings.get("obs_args", "--disable-crash-handl
 obs_args_entry.grid(row=row, column=1, sticky="ew", pady=2, padx=(5, 0))
 row += 1
 
+# OBS Scene selector
+tk.Label(frame, text="Start Scene:").grid(row=row, column=0, sticky="w", pady=2)
+scene_frame = tk.Frame(frame)
+scene_frame.grid(row=row, column=1, sticky="ew", pady=2, padx=(5, 0))
+scene_frame.grid_columnconfigure(0, weight=1)
+
+obs_scenes = get_obs_scenes()
+current_scene = get_scene_from_args(current_settings.get("obs_args", ""))
+scene_choices = ["(None)"] + obs_scenes
+
+scene_combo = ttk.Combobox(scene_frame, values=scene_choices, state='readonly')
+if current_scene and current_scene in obs_scenes:
+    scene_combo.set(current_scene)
+else:
+    scene_combo.set("(None)")
+scene_combo.grid(row=0, column=0, sticky="ew")
+
+def refresh_scenes():
+    """Refresh the scene list from OBS"""
+    scenes = get_obs_scenes()
+    scene_choices = ["(None)"] + scenes
+    scene_combo['values'] = scene_choices
+    save_status_label.config(text=f"✓ Found {len(scenes)} scenes", fg="green")
+    root.after(2000, lambda: save_status_label.config(text=""))
+
+tk.Button(scene_frame, text="Refresh", command=refresh_scenes, width=8).grid(row=0, column=1, padx=(5, 0))
+row += 1
+
 # Save button at the bottom
 button_frame = tk.Frame(root)
 button_frame.grid(row=2, column=0, columnspan=2, pady=(10, 10))
@@ -447,8 +729,17 @@ button_frame.grid(row=2, column=0, columnspan=2, pady=(10, 10))
 save_status_label = tk.Label(button_frame, text="", fg="green")
 save_status_label.pack()
 
-save_btn = tk.Button(button_frame, text="Save Settings", command=save_and_refresh, width=15)
-save_btn.pack()
+buttons_row = tk.Frame(button_frame)
+buttons_row.pack()
+
+auto_setup_btn = tk.Button(buttons_row, text="Auto-Setup", command=run_auto_setup, width=12)
+auto_setup_btn.pack(side=tk.LEFT, padx=5)
+
+save_btn = tk.Button(buttons_row, text="Save Settings", command=save_and_refresh, width=15)
+save_btn.pack(side=tk.LEFT, padx=5)
+
+# Check for first run after window is ready
+root.after(200, check_first_run)
 
 # Update status on startup
 root.after(100, update_status)
