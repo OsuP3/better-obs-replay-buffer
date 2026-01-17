@@ -1,3 +1,20 @@
+# User settings (contains personal paths)
 settings.txt
+.setup_done
+
+# Logs
 *.log
+
+# Python
 venv/
+__pycache__/
+*.pyc
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+
+# Old files (replaced by modular structure)
+better-replay-buffer.pyw
+main.py
