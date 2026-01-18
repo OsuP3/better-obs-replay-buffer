@@ -10,6 +10,7 @@ import sys
 import subprocess
 import time
 import re
+import ctypes
 
 def run_gui():
     """Main entry point for the settings GUI"""
@@ -20,17 +21,20 @@ def run_gui():
     if getattr(sys, 'frozen', False):
         EXE_DIR = os.path.dirname(sys.executable)
         BUNDLE_DIR = sys._MEIPASS
-        # The service runs with --service flag on the same exe
-        SERVICE_CMD = [sys.executable, "--service"]
+        # Service is a separate exe
+        SERVICE_EXE = os.path.join(EXE_DIR, "BetterReplayBufferService.exe")
+        SERVICE_CMD = [SERVICE_EXE]
     else:
         EXE_DIR = os.path.dirname(os.path.abspath(__file__))
         BUNDLE_DIR = EXE_DIR
-        SERVICE_CMD = [sys.executable, os.path.join(EXE_DIR, "app.py"), "--service"]
+        SERVICE_CMD = [sys.executable, os.path.join(EXE_DIR, "service.py")]
+        SERVICE_EXE = None
 
     SETTINGS_FILE = os.path.join(EXE_DIR, "settings.txt")
     TEMP = os.getenv("TEMP") or os.getenv("TMP") or "."
     REFRESH_FILE = os.path.join(TEMP, "obs_toast.refresh")
     PID_FILE = os.path.join(TEMP, "obs_toast.pid")
+    LOCK_FILE = os.path.join(TEMP, "obs_toast.lock")
     FIRST_RUN_FILE = os.path.join(EXE_DIR, ".setup_done")
 
     # Startup shortcut path
@@ -228,6 +232,7 @@ def run_gui():
         return os.path.exists(STARTUP_SHORTCUT)
 
     def enable_startup():
+        """Create startup shortcut using Python's win32com (faster than PowerShell)"""
         try:
             if getattr(sys, 'frozen', False):
                 target_path = sys.executable
@@ -239,16 +244,29 @@ def run_gui():
                 target_path = pythonw
                 arguments = f'"{os.path.join(EXE_DIR, "app.py")}" --service'
             
-            ps_script = f'''
-$WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("{STARTUP_SHORTCUT}")
-$Shortcut.TargetPath = "{target_path}"
-$Shortcut.Arguments = '{arguments}'
-$Shortcut.WorkingDirectory = "{EXE_DIR}"
-$Shortcut.Description = "Better Replay Buffer"
-$Shortcut.Save()
-'''
-            subprocess.run(["powershell", "-Command", ps_script], capture_output=True, text=True)
+            # Use ctypes to create shortcut (much faster than PowerShell)
+            import ctypes.wintypes
+            
+            # Write a simple .url file as fallback, or use VBScript which is faster than PS
+            vbs_script = f'''Set WshShell = CreateObject("WScript.Shell")
+Set Shortcut = WshShell.CreateShortcut("{STARTUP_SHORTCUT}")
+Shortcut.TargetPath = "{target_path}"
+Shortcut.Arguments = "{arguments}"
+Shortcut.WorkingDirectory = "{EXE_DIR}"
+Shortcut.Description = "Better Replay Buffer"
+Shortcut.Save'''
+            
+            vbs_path = os.path.join(TEMP, "create_shortcut.vbs")
+            with open(vbs_path, "w") as f:
+                f.write(vbs_script)
+            
+            subprocess.run(["cscript", "//nologo", vbs_path], capture_output=True, text=True, timeout=5)
+            
+            try:
+                os.remove(vbs_path)
+            except:
+                pass
+            
             return True
         except Exception as e:
             messagebox.showerror("Error", f"Failed to enable startup: {e}")
@@ -263,27 +281,78 @@ $Shortcut.Save()
             messagebox.showerror("Error", f"Failed to disable startup: {e}")
             return False
 
-    def is_script_running():
-        if not os.path.exists(PID_FILE):
-            return False
+    # Windows API constants for process enumeration
+    TH32CS_SNAPPROCESS = 0x00000002
+    
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ('dwSize', ctypes.c_ulong),
+            ('cntUsage', ctypes.c_ulong),
+            ('th32ProcessID', ctypes.c_ulong),
+            ('th32DefaultHeapID', ctypes.c_void_p),
+            ('th32ModuleID', ctypes.c_ulong),
+            ('cntThreads', ctypes.c_ulong),
+            ('th32ParentProcessID', ctypes.c_ulong),
+            ('pcPriClassBase', ctypes.c_long),
+            ('dwFlags', ctypes.c_ulong),
+            ('szExeFile', ctypes.c_char * 260),
+        ]
+
+    def get_running_processes():
+        """Get dict of running processes {name: [pids]} using Windows API (very fast)"""
+        processes = {}
+        kernel32 = ctypes.windll.kernel32
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == -1:
+            return processes
         
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            output = subprocess.check_output(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                text=True, stderr=subprocess.DEVNULL
-            )
-            return str(pid) in output and "INFO:" not in output
-        except:
-            return False
+        pe32 = PROCESSENTRY32()
+        pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        
+        if kernel32.Process32First(snapshot, ctypes.byref(pe32)):
+            while True:
+                try:
+                    name = pe32.szExeFile.decode('utf-8', errors='ignore').lower()
+                    pid = pe32.th32ProcessID
+                    if name not in processes:
+                        processes[name] = []
+                    processes[name].append(pid)
+                except:
+                    pass
+                if not kernel32.Process32Next(snapshot, ctypes.byref(pe32)):
+                    break
+        
+        kernel32.CloseHandle(snapshot)
+        return processes
+
+    def is_script_running():
+        """Check if service is running - by PID file or by process name"""
+        procs = get_running_processes()
+        
+        # Quick check: is any BetterReplayBufferService.exe running?
+        if "betterreplaybufferservice.exe" in procs:
+            return True
+        
+        # Fallback: check PID file (for dev mode with python.exe)
+        if os.path.exists(PID_FILE):
+            try:
+                with open(PID_FILE, "r") as f:
+                    content = f.read().strip()
+                    if content:
+                        pid = int(content)
+                        if pid in procs.get("python.exe", []) or pid in procs.get("pythonw.exe", []):
+                            return True
+                        # Stale PID file
+                        os.remove(PID_FILE)
+            except:
+                pass
+        
+        return False
 
     def is_obs_running():
-        try:
-            output = subprocess.check_output(["tasklist"], text=True, stderr=subprocess.DEVNULL).lower()
-            return "obs64.exe" in output or "obs32.exe" in output
-        except:
-            return False
+        """Check if OBS is running using Windows API (instant)"""
+        procs = get_running_processes()
+        return 'obs64.exe' in procs or 'obs32.exe' in procs
 
     def start_obs(force=False):
         settings = read_settings()
@@ -305,80 +374,141 @@ $Shortcut.Save()
             return False
 
     def stop_obs():
+        """Stop OBS using taskkill /F /T - safe because OBS should be launched with --disable-shutdown-check"""
         try:
-            subprocess.run(["taskkill", "/IM", "obs64.exe", "/F"], capture_output=True, text=True)
-            subprocess.run(["taskkill", "/IM", "obs32.exe", "/F"], capture_output=True, text=True)
+            # Get OBS PIDs first
+            procs = get_running_processes()
+            obs_pids = procs.get('obs64.exe', []) + procs.get('obs32.exe', [])
+            
+            if not obs_pids:
+                return True  # Already not running
+            
+            # Kill by PID (more reliable than by image name)
+            for pid in obs_pids:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], 
+                              capture_output=True, timeout=5)
+            
+            # Verify OBS is dead (wait up to 2 seconds)
+            for _ in range(10):
+                time.sleep(0.2)
+                procs = get_running_processes()
+                if 'obs64.exe' not in procs and 'obs32.exe' not in procs:
+                    return True
+            
+            # Last resort: try by image name
+            subprocess.run(["taskkill", "/IM", "obs64.exe", "/F", "/T"], 
+                          capture_output=True, timeout=5)
+            subprocess.run(["taskkill", "/IM", "obs32.exe", "/F", "/T"], 
+                          capture_output=True, timeout=5)
+            
             return True
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to stop OBS: {e}")
+            print(f"stop_obs error: {e}")
             return False
 
     def refresh_script():
         try:
-            with open(REFRESH_FILE, "w") as f:
+            # Write atomically to avoid partial reads
+            tmp_file = REFRESH_FILE + ".tmp"
+            with open(tmp_file, "w") as f:
                 f.write(f"{time.time()}:{os.getpid()}")
+            # Atomic rename
+            try:
+                os.replace(tmp_file, REFRESH_FILE)
+            except:
+                os.rename(tmp_file, REFRESH_FILE)
+            
             update_status()
             save_status_label.config(text="✓ Refreshed!", fg="green")
             root.after(2000, lambda: save_status_label.config(text=""))
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to refresh: {e}")
+            save_status_label.config(text=f"Refresh failed: {e}", fg="red")
+            root.after(3000, lambda: save_status_label.config(text=""))
 
     def start_script():
-        if include_obs_var.get():
-            start_obs()
-        
-        subprocess.Popen(SERVICE_CMD, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        root.after(1000, update_status)
-        msg = "✓ Started!"
-        if include_obs_var.get():
-            msg += " (OBS included)"
-        save_status_label.config(text=msg, fg="green")
-        root.after(2000, lambda: save_status_label.config(text=""))
+        try:
+            # Don't start OBS here - let the service handle it
+            # The service always starts OBS on launch if configured
+            
+            subprocess.Popen(SERVICE_CMD, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            
+            # Poll status a few times to catch when service is ready
+            def poll_status(count=0):
+                update_status()
+                if count < 5 and not is_script_running():
+                    root.after(500, lambda: poll_status(count + 1))
+            
+            root.after(500, poll_status)
+            save_status_label.config(text="✓ Started!", fg="green")
+            root.after(2000, lambda: save_status_label.config(text=""))
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start: {e}")
+
+    def get_my_process_tree():
+        """Not needed anymore - service is separate exe"""
+        return set()
+
+    def kill_service_processes():
+        """Kill all BetterReplayBufferService.exe processes"""
+        # Kill by name
+        os.system('taskkill /F /IM BetterReplayBufferService.exe >nul 2>&1')
+        time.sleep(0.5)
+        # Kill again to be sure (PyInstaller parent/child)
+        os.system('taskkill /F /IM BetterReplayBufferService.exe >nul 2>&1')
+        time.sleep(0.3)
+        # Clean up files
+        for f in [PID_FILE, LOCK_FILE]:
+            try:
+                os.remove(f)
+            except:
+                pass
+        return True
 
     def stop_script():
-        stopped_script = False
-        if os.path.exists(PID_FILE):
-            try:
-                with open(PID_FILE, "r") as f:
-                    pid = int(f.read().strip())
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
-                stopped_script = True
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to stop script: {e}")
+        kill_service_processes()
         
         if include_obs_var.get():
             stop_obs()
         
-        root.after(500, update_status)
+        root.after(300, update_status)
         if stopped_script or include_obs_var.get():
             save_status_label.config(text="✓ Stopped!", fg="green")
             root.after(2000, lambda: save_status_label.config(text=""))
         else:
-            messagebox.showwarning("Warning", "Script is not running.")
+            save_status_label.config(text="Script not running", fg="gray")
+            root.after(2000, lambda: save_status_label.config(text=""))
 
     def restart_script():
-        if os.path.exists(PID_FILE):
-            try:
-                with open(PID_FILE, "r") as f:
-                    pid = int(f.read().strip())
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
-            except:
-                pass
+        # Kill all service processes
+        kill_service_processes()
         
+        # Stop OBS if checkbox is checked (service will restart it)
         if include_obs_var.get():
-            stop_obs()
-            time.sleep(1)
-            start_obs(force=True)
-            time.sleep(2)
+            stop_obs()  # This waits for OBS to actually die
         
-        subprocess.Popen(SERVICE_CMD, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        # Update status to show stopped
+        update_status()
         
-        root.after(1000, update_status)
-        msg = "✓ Restarted!"
-        if include_obs_var.get():
-            msg = "✓ OBS and script restarted!"
-        save_status_label.config(text=msg, fg="green")
-        root.after(2000, lambda: save_status_label.config(text=""))
+        def do_restart():
+            """Actual restart after brief delay"""
+            # Just start the service - it will handle OBS
+            subprocess.Popen(SERVICE_CMD, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            
+            # Poll status until service is running (up to 10 seconds)
+            def poll_status(count=0):
+                update_status()
+                if count < 20 and not is_script_running():
+                    root.after(500, lambda: poll_status(count + 1))
+            
+            root.after(1000, poll_status)  # Wait 1 second before first check
+            msg = "✓ Restarted!"
+            if include_obs_var.get():
+                msg = "✓ Script restarted (OBS will restart)"
+            save_status_label.config(text=msg, fg="green")
+            root.after(2000, lambda: save_status_label.config(text=""))
+        
+        # Small delay to let things settle, then restart
+        root.after(500, do_restart)
 
     def update_status():
         if is_script_running():
@@ -391,6 +521,11 @@ $Shortcut.Save()
             start_btn.config(state="normal")
             stop_btn.config(state="disabled")
             refresh_btn.config(state="disabled")
+    
+    def auto_refresh_status():
+        """Periodically refresh status every 3 seconds"""
+        update_status()
+        root.after(3000, auto_refresh_status)
 
     def run_auto_setup():
         detected = auto_detect_settings()
@@ -691,5 +826,9 @@ $Shortcut.Save()
     # Initialize
     root.after(200, check_first_run)
     root.after(100, update_status)
+    root.after(3000, auto_refresh_status)  # Start periodic status refresh
 
     root.mainloop()
+
+if __name__ == "__main__":
+    run_gui()

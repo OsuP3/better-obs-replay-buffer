@@ -62,16 +62,21 @@ def run_service():
     refresh_file_path = os.path.join(TEMP, "obs_toast.refresh")
 
     def _atomic_write(path: str, data: str):
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(data)
-        os.replace(tmp, path)
+        """Write file atomically, with fallback to direct write"""
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except:
+            # Fallback: direct write
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
 
     # Try to lock. if already locked, request refresh and exit
     try:
         lock_file = open(lock_file_path, "w")
         msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        _atomic_write(pid_file_path, str(os.getpid()))
     except OSError:
         try:
             _atomic_write(refresh_file_path, f"{time.time()}:{os.getpid()}")
@@ -79,6 +84,12 @@ def run_service():
         except Exception:
             pass
         sys.exit(0)
+    
+    # Write PID file (separate try so lock success doesn't get undone)
+    try:
+        _atomic_write(pid_file_path, str(os.getpid()))
+    except Exception as e:
+        logger.error(f"Failed to write PID file: {e}")
 
     def _cleanup():
         try:
@@ -189,16 +200,30 @@ def run_service():
         logger.warning(f"OBS executable not found at '{OBS_EXE}'. It will be skipped.")
         OBS_EXE = None
     else:
-        try:
-            obs_name = os.path.basename(OBS_EXE).lower()
-            proc_list = subprocess.check_output(["tasklist"], text=True, stderr=subprocess.DEVNULL).lower()
-            if obs_name in proc_list:
-                logger.info("OBS is already running; skipping launch.")
-            else:
+        def is_obs_running():
+            """Check if OBS is running"""
+            try:
+                result = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe"], 
+                                       capture_output=True, text=True, timeout=5)
+                if "obs64.exe" in result.stdout.lower():
+                    return True
+                result = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs32.exe"], 
+                                       capture_output=True, text=True, timeout=5)
+                return "obs32.exe" in result.stdout.lower()
+            except:
+                return False
+        
+        # Wait a moment in case OBS is still starting up
+        time.sleep(1)
+        
+        if is_obs_running():
+            logger.info("OBS is already running; skipping launch.")
+        else:
+            try:
                 subprocess.Popen(f'"{OBS_EXE}" {OBS_ARGS}', shell=True, cwd=os.path.dirname(OBS_EXE))
                 logger.info("OBS started successfully.")
-        except Exception:
-            logger.exception("Failed to check/start OBS at startup")
+            except Exception:
+                logger.exception("Failed to start OBS")
 
     toast_queue = queue.Queue()
 
@@ -383,3 +408,6 @@ def run_service():
         logger.info("KeyboardInterrupt received, exiting")
     finally:
         _cleanup()
+
+if __name__ == "__main__":
+    run_service()

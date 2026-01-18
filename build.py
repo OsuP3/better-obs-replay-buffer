@@ -1,9 +1,9 @@
 """
 Build script for Better OBS Replay Buffer
-Creates a single standalone executable using PyInstaller
+Creates two executables: GUI and Service
 
 Usage:
-    python build.py       - Build the executable
+    python build.py       - Build both executables
     python build.py clean - Remove build artifacts
 """
 
@@ -38,24 +38,33 @@ def clean():
             os.remove(os.path.join(SCRIPT_DIR, f))
 
 def build():
-    """Build the single executable"""
+    """Build both executables"""
     install_pyinstaller()
     clean()
     
-    # Build single exe from app.py entry point
-    # Includes service.py and settings_gui.py as hidden imports
-    print("\n=== Building Better Replay Buffer ===")
+    # Build GUI exe
+    print("\n=== Building Settings GUI ===")
     subprocess.check_call([
         sys.executable, "-m", "PyInstaller",
         "--onefile",
-        "--windowed",  # No console window
+        "--windowed",
         "--name", "BetterReplayBuffer",
-        "--icon", "NONE",  # Add --icon path/to/icon.ico if you have one
+        "--icon", "NONE",
         "--add-data", f"notification.wav;.",
         "--add-data", f"settings.example.txt;.",
-        "--hidden-import", "service",
-        "--hidden-import", "settings_gui",
-        "app.py"
+        "settings_gui.py"
+    ], cwd=SCRIPT_DIR)
+    
+    # Build Service exe
+    print("\n=== Building Service ===")
+    subprocess.check_call([
+        sys.executable, "-m", "PyInstaller",
+        "--onefile",
+        "--windowed",
+        "--name", "BetterReplayBufferService",
+        "--icon", "NONE",
+        "--add-data", f"notification.wav;.",
+        "service.py"
     ], cwd=SCRIPT_DIR)
     
     # Copy additional files to dist
